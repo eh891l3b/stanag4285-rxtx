@@ -10,7 +10,7 @@
  *
  * Modes: 75n/s/l  150n/s/l  300n/s/l  600n/s/l
  *        1200n/s/l/u  2400n/s/l/u  3600u
- * Default: 600s
+ * Default: 600l
  */
 
 #define MINIAUDIO_IMPLEMENTATION
@@ -390,8 +390,8 @@ static Kmode parse_mode(const char *s)
     if (!strcmp(buf, "2400l")) return B2400L;
     if (!strcmp(buf, "2400u")) return B2400U;
     if (!strcmp(buf, "3600u")) return B3600U;
-    fprintf(stderr, "Unknown mode '%s', defaulting to 600s\n", s);
-    return B600S;
+    fprintf(stderr, "Unknown mode '%s', defaulting to 600l\n", s);
+    return B600L;
 }
 
 static FramingMode parse_framing(const char *s)
@@ -412,7 +412,7 @@ static void print_usage(const char *prog)
         "\n"
         "Modes: 75n/s/l  150n/s/l  300n/s/l  600n/s/l\n"
         "       1200n/s/l/u  2400n/s/l/u  3600u\n"
-        "Default mode: 600s\n"
+        "Default mode: 600l\n"
         "\n"
         "Framing:\n"
         "  none   Raw bytes, no framing (default)\n"
@@ -634,7 +634,7 @@ static void run_rx_wav(const char *infile)
 int main(int argc, char *argv[])
 {
     int   tx_flag  = -1;
-    Kmode mode     = B600S;
+    Kmode mode     = B600L;
     char *wav_path = NULL;
 
     for (int i = 1; i < argc; i++) {
