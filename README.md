@@ -109,8 +109,7 @@ sox tx.wav -r 48000 tx_48k.wav   # resample for your soundcard if needed
 (rate 1/2, K=7) → interleaver → 8-PSK/QPSK/BPSK scrambled symbols →
 RRC pulse shaping → 1800 Hz carrier → 16-bit PCM at 9600 Hz.
 
-**RX:** 16-bit PCM at 9600 Hz → three-channel frequency search (1765 /
-1800 / 1835 Hz) → preamble correlator → Doppler correction → RRC matched
+**RX:** 16-bit PCM at 9600 Hz → single-channel frequency search (1800 Hz) → preamble correlator → Doppler correction → RRC matched
 filter → Kalman DFE equalizer → BPSK/QPSK/8-PSK demodulator → soft-output
 Viterbi decoder → de-interleaver → HDLC deframe → stdout.
 
