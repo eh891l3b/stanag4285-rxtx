@@ -16,6 +16,7 @@
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,251 @@ extern unsigned short tx_samples[];
 extern int            con_tx_octets_per_block;
 extern int            con_rx_octets_per_block;
 extern int            con_tx_flush_octets;
+
+/* ------------------------------------------------------------------ */
+/* Byte framing                                                        */
+/* ------------------------------------------------------------------ */
+
+typedef enum { FRAMING_NONE, FRAMING_8N1, FRAMING_5N1 } FramingMode;
+
+static FramingMode g_framing = FRAMING_NONE;
+
+/*
+ * The modem's data path operates on whole bytes at a time via tx_octet()
+ * on TX and output_data() on RX.  Framing works at the *bit* level, so
+ * we need two thin shims:
+ *
+ *   TX: accumulate individual framing bits into a byte, flush via
+ *       tx_octet() every 8 bits.  The bit stream flows transparently
+ *       through the modem's convolutional encoder and interleaver just
+ *       like any other data; STANAG frame boundaries are irrelevant.
+ *
+ *   RX: output_data() delivers packed bytes.  Unpack them MSB→LSB and
+ *       feed each bit into the deframer state machine.
+ */
+
+/* ------------------------------------------------------------------ */
+/* TX bit accumulator                                                  */
+/* ------------------------------------------------------------------ */
+
+static uint8_t  g_tx_bit_buf   = 0;
+static int      g_tx_bit_count = 0;
+
+/* Queue one bit into the TX pipeline. */
+static void tx_bit(int bit)
+{
+    g_tx_bit_buf |= (uint8_t)((bit & 1) << g_tx_bit_count);
+    if (++g_tx_bit_count == 8) {
+        tx_octet(g_tx_bit_buf);
+        g_tx_bit_buf   = 0;
+        g_tx_bit_count = 0;
+    }
+}
+
+/* Flush any partial byte with mark (1) padding — call at end of TX block. */
+static void tx_bit_flush(void)
+{
+    while (g_tx_bit_count != 0)
+        tx_bit(1);   /* idle/mark padding */
+}
+
+/* ------------------------------------------------------------------ */
+/* ITA2 (Baudot / CCITT-2) tables                                     */
+/* ------------------------------------------------------------------ */
+
+#define ITA2_LTRS 0x1F
+#define ITA2_FIGS 0x1B
+#define ITA2_SP   0x04
+#define ITA2_CR   0x08
+#define ITA2_LF   0x02
+#define ITA2_NONE 0xFF
+
+/* ASCII → ITA2 code, LTRS plane (0xFF = not in this plane) */
+static const uint8_t ita2_ascii_to_ltrs[128] = {
+    /* 0-7   */ 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    /* 8-15  */ 0xFF,0xFF,ITA2_LF,0xFF,0xFF,ITA2_CR,0xFF,0xFF,
+    /* 16-23 */ 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    /* 24-31 */ 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    /* 32 SP */ ITA2_SP,
+    /* 33-47 */ 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    /* 48-57 '0'-'9' digits only in FIGS */
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    /* 58-64 */ 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    /* 65-90 'A'-'Z' */
+    0x03,0x19,0x0E,0x09,0x01,0x0D,0x1A,0x14,0x06,0x0B,
+    0x0F,0x12,0x1C,0x0C,0x18,0x16,0x17,0x0A,0x05,0x10,
+    0x07,0x1E,0x13,0x1D,0x15,0x11,
+    /* 91-96 */ 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    /* 97-122 'a'-'z' same codes as uppercase */
+    0x03,0x19,0x0E,0x09,0x01,0x0D,0x1A,0x14,0x06,0x0B,
+    0x0F,0x12,0x1C,0x0C,0x18,0x16,0x17,0x0A,0x05,0x10,
+    0x07,0x1E,0x13,0x1D,0x15,0x11,
+    /* 123-127 */ 0xFF,0xFF,0xFF,0xFF,0xFF
+};
+
+/* ASCII → ITA2 code, FIGS plane */
+static const uint8_t ita2_ascii_to_figs[128] = {
+    /* 0-7   */ 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    /* 8-15  */ 0xFF,0xFF,ITA2_LF,0xFF,0xFF,ITA2_CR,0xFF,0xFF,
+    /* 16-31 */ 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    /* 32 SP */ ITA2_SP,
+    /* 33 !  */ 0xFF, /* 34 "  */ 0x11, /* 35 #  */ 0xFF,
+    /* 36 $  */ 0xFF, /* 37 %  */ 0xFF, /* 38 &  */ 0xFF,
+    /* 39 '  */ 0xFF, /* 40 (  */ 0x16, /* 41 )  */ 0x15,
+    /* 42 *  */ 0xFF, /* 43 +  */ 0xFF, /* 44 ,  */ 0x0C,
+    /* 45 -  */ 0x03, /* 46 .  */ 0x1C, /* 47 /  */ 0x1D,
+    /* 48 0  */ 0x16, /* 49 1  */ 0x17, /* 50 2  */ 0x13,
+    /* 51 3  */ 0x01, /* 52 4  */ 0x0A, /* 53 5  */ 0x10,
+    /* 54 6  */ 0x15, /* 55 7  */ 0x07, /* 56 8  */ 0x06,
+    /* 57 9  */ 0x18,
+    /* 58 :  */ 0x0E, /* 59 ;  */ 0xFF, /* 60 <  */ 0xFF,
+    /* 61 =  */ 0xFF, /* 62 >  */ 0xFF, /* 63 ?  */ 0x19,
+    /* 64 @  */ 0xFF,
+    /* 65-90 'A'-'Z' not in FIGS */
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    /* 91-96 */ 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    /* 97-122 'a'-'z' not in FIGS */
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    /* 123-127 */ 0xFF,0xFF,0xFF,0xFF,0xFF
+};
+
+/* ITA2 code → ASCII, LTRS plane ('\0' = non-printing / shift) */
+static const uint8_t ita2_ltrs_to_ascii[32] = {
+    '\0','E','\n','A',' ','S','I','U',
+    '\r','D','R','J','N','F','C','K',
+    'T','Z','L','W','H','Y','P','Q',
+    'O','B','G','\0','M','X','V','\0'   /* 0x1B=FIGS, 0x1F=LTRS */
+};
+
+/* ITA2 code → ASCII, FIGS plane */
+static const uint8_t ita2_figs_to_ascii[32] = {
+    '\0','3','\n','-',' ','\'','8','7',
+    '\r','\0','4','\0',',','!',':','(',
+    '5','"',')','2','#','6','0','1',
+    '9','?','&','\0','.','/',';','\0'
+};
+
+/* ------------------------------------------------------------------ */
+/* TX framing                                                          */
+/* ------------------------------------------------------------------ */
+
+/* Send one 5-bit ITA2 code as a 5N1 async frame (7 bits total). */
+static void tx_5n1_code(uint8_t code)
+{
+    tx_bit(0);                          /* start bit (space) */
+    for (int b = 0; b < 5; b++)
+        tx_bit((code >> b) & 1);        /* data bits, LSB first */
+    tx_bit(1);                          /* stop bit (mark) */
+}
+
+/* Send one byte as an 8N1 async frame (10 bits total). */
+static void tx_8n1_byte(unsigned char byte)
+{
+    tx_bit(0);                          /* start bit */
+    for (int b = 0; b < 8; b++)
+        tx_bit((byte >> b) & 1);        /* data bits, LSB first */
+    tx_bit(1);                          /* stop bit */
+}
+
+/* Send one ASCII character as ITA2 5N1, emitting shift codes as needed.
+ * Returns updated figs state (0=LTRS, 1=FIGS).
+ * Unsupported characters are silently dropped.                        */
+static int tx_ita2_char(unsigned char ch, int in_figs)
+{
+    if (ch >= 128) return in_figs;
+
+    uint8_t lc = ita2_ascii_to_ltrs[ch];
+    uint8_t fc = ita2_ascii_to_figs[ch];
+
+    /* Plane-agnostic characters (SP, CR, LF share the same code) */
+    if (lc != ITA2_NONE && lc == fc) {
+        tx_5n1_code(lc);
+        return in_figs;
+    }
+
+    if (!in_figs && lc != ITA2_NONE) { tx_5n1_code(lc); return 0; }
+    if ( in_figs && fc != ITA2_NONE) { tx_5n1_code(fc); return 1; }
+
+    /* Need a shift */
+    if (lc != ITA2_NONE) { tx_5n1_code(ITA2_LTRS); tx_5n1_code(lc); return 0; }
+    if (fc != ITA2_NONE) { tx_5n1_code(ITA2_FIGS); tx_5n1_code(fc); return 1; }
+
+    return in_figs; /* unsupported — drop */
+}
+
+/* ------------------------------------------------------------------ */
+/* RX deframing                                                        */
+/* ------------------------------------------------------------------ */
+
+/* Feed one decoded bit into the 8N1 state machine. */
+static void rx_bit_8n1(int bit)
+{
+    static enum { S_IDLE, S_DATA, S_STOP } state = S_IDLE;
+    static int     bit_count = 0;
+    static uint8_t accum     = 0;
+
+    switch (state) {
+        case S_IDLE:
+            if (bit == 0) { bit_count = 0; accum = 0; state = S_DATA; }
+            break;
+        case S_DATA:
+            accum |= (uint8_t)(bit << bit_count);
+            if (++bit_count == 8) state = S_STOP;
+            break;
+        case S_STOP:
+            if (bit == 1) { fwrite(&accum, 1, 1, stdout); fflush(stdout); }
+            state = S_IDLE;
+            break;
+    }
+}
+
+/* Feed one decoded bit into the 5N1 ITA2 state machine. */
+static void rx_bit_5n1(int bit)
+{
+    static enum { S_IDLE, S_DATA, S_STOP } state = S_IDLE;
+    static int     bit_count = 0;
+    static uint8_t accum     = 0;
+    static int     in_figs   = 0;
+
+    switch (state) {
+        case S_IDLE:
+            if (bit == 0) { bit_count = 0; accum = 0; state = S_DATA; }
+            break;
+        case S_DATA:
+            accum |= (uint8_t)(bit << bit_count);
+            if (++bit_count == 5) state = S_STOP;
+            break;
+        case S_STOP:
+            if (bit == 1) {
+                if      (accum == ITA2_LTRS) { in_figs = 0; }
+                else if (accum == ITA2_FIGS) { in_figs = 1; }
+                else {
+                    uint8_t ch = in_figs ? ita2_figs_to_ascii[accum]
+                                         : ita2_ltrs_to_ascii[accum];
+                    if (ch != '\0') { fwrite(&ch, 1, 1, stdout); fflush(stdout); }
+                }
+            }
+            state = S_IDLE;
+            break;
+    }
+}
+
+/* Unpack a buffer of packed bytes into individual bits and feed them
+ * to the chosen deframer.  output_data() delivers real bytes (8 bits
+ * each), so we must unpack before the state machines can see them.   */
+static void rx_deframe(unsigned char *data, int length)
+{
+    for (int i = 0; i < length; i++)
+        for (int b = 0; b < 8; b++) {
+            int bit = (data[i] >> b) & 1;
+            if (g_framing == FRAMING_8N1) rx_bit_8n1(bit);
+            else                          rx_bit_5n1(bit);
+        }
+}
 
 /* ------------------------------------------------------------------ */
 static volatile int g_running = 1;
@@ -148,16 +394,31 @@ static Kmode parse_mode(const char *s)
     return B600S;
 }
 
+static FramingMode parse_framing(const char *s)
+{
+    if (!strcmp(s, "none")) return FRAMING_NONE;
+    if (!strcmp(s, "8n1"))  return FRAMING_8N1;
+    if (!strcmp(s, "5n1"))  return FRAMING_5N1;
+    fprintf(stderr, "Unknown framing '%s', defaulting to none\n", s);
+    return FRAMING_NONE;
+}
+
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
         "Usage:\n"
-        "  %s -tx [-mode <MODE>] [-wav <outfile.wav>]\n"
-        "  %s -rx [-mode <MODE>] [-wav <infile.wav>]\n"
+        "  %s -tx [-mode <MODE>] [-wav <outfile.wav>] [-framing none|8n1|5n1]\n"
+        "  %s -rx [-mode <MODE>] [-wav <infile.wav>]  [-framing none|8n1|5n1]\n"
         "\n"
         "Modes: 75n/s/l  150n/s/l  300n/s/l  600n/s/l\n"
         "       1200n/s/l/u  2400n/s/l/u  3600u\n"
         "Default mode: 600s\n"
+        "\n"
+        "Framing:\n"
+        "  none   Raw bytes, no framing (default)\n"
+        "  8n1    Async 8-bit: 1 start + 8 data (LSB-first) + 1 stop\n"
+        "  5n1    ITA2/Baudot: 1 start + 5 data (LSB-first) + 1 stop\n"
+        "         TX only sends supported characters; unsupported are dropped\n"
         "\n"
         "TX: reads raw bytes from stdin, encodes, plays via speaker or -wav file\n"
         "RX: decodes audio from mic or -wav file, writes raw bytes to stdout\n",
@@ -195,8 +456,35 @@ static void tx_encode_block(const unsigned char *data, int n)
     memcpy(buf, data, n);
 
     tx_sample_count = 0;
-    for (int i = 0; i < pad; i++)
-        tx_octet(buf[i]);
+
+    if (g_framing == FRAMING_NONE) {
+        for (int i = 0; i < pad; i++)
+            tx_octet(buf[i]);
+    } else if (g_framing == FRAMING_8N1) {
+        for (int i = 0; i < n; i++)
+            tx_8n1_byte(buf[i]);
+        tx_bit_flush();
+    } else { /* FRAMING_5N1 */
+        static int figs_state = 0;
+        for (int i = 0; i < n; i++)
+            figs_state = tx_ita2_char(buf[i], figs_state);
+        /* End block: LTRS shift + flush with mark padding */
+        tx_5n1_code(ITA2_LTRS);
+        figs_state = 0;
+        tx_bit_flush();
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* RX output dispatcher                                                */
+void output_data_framed(unsigned char *data, int length)
+{
+    if (g_framing == FRAMING_NONE) {
+        fwrite(data, 1, length, stdout);
+        fflush(stdout);
+    } else {
+        rx_deframe(data, length);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -356,6 +644,8 @@ int main(int argc, char *argv[])
             mode = parse_mode(argv[++i]);
         else if (!strcmp(argv[i], "-wav") && i + 1 < argc)
             wav_path = argv[++i];
+        else if (!strcmp(argv[i], "-framing") && i + 1 < argc)
+            g_framing = parse_framing(argv[++i]);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             print_usage(argv[0]); return 0;
         } else {
@@ -375,14 +665,17 @@ int main(int argc, char *argv[])
     setvbuf(stdout, NULL, _IONBF, 0);
     modem_init(mode);
 
+    const char *framing_name = (g_framing == FRAMING_8N1) ? "8n1"
+                             : (g_framing == FRAMING_5N1) ? "5n1" : "none";
+
     if (tx_flag) {
-        fprintf(stderr, "[STANAG 4285 TX] mode=%s  output=%s\n",
-                argv[0], wav_path ? wav_path : "live audio");
+        fprintf(stderr, "[STANAG 4285 TX] mode=%s  framing=%s  output=%s\n",
+                argv[0], framing_name, wav_path ? wav_path : "live audio");
         if (wav_path) run_tx_wav(wav_path);
         else          run_tx_live();
     } else {
-        fprintf(stderr, "[STANAG 4285 RX] mode=%s  input=%s\n",
-                argv[0], wav_path ? wav_path : "live audio");
+        fprintf(stderr, "[STANAG 4285 RX] mode=%s  framing=%s  input=%s\n",
+                argv[0], framing_name, wav_path ? wav_path : "live audio");
         if (wav_path) run_rx_wav(wav_path);
         else          run_rx_live();
     }
