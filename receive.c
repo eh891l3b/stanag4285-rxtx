@@ -1,6 +1,5 @@
 /*
  * Receive module for STANAG 4285 modem.
- * Auto-baud and shared-memory references removed.
  */
 #include <stdio.h>
 #include <math.h>
@@ -14,19 +13,12 @@ extern float    rx_coffs[RX_FILTER_SIZE];
 int rx_mode;
 extern int con_bad_probe_threshold;
 
-#define LOW_RX_CHAN 0
-#define MID_RX_CHAN 1
-#define HIH_RX_CHAN 2
-#define RX_CHANNELS 3
-
 typedef enum { RX_HUNTING, RX_DATA } RxState;
 
 static RxState  rx_state;
-static float    delta[RX_CHANNELS];
-static float    acc[RX_CHANNELS];
-
-static FComplex in_a[RX_CHANNELS][SAMPLE_BLOCK_SIZE + RX_FILTER_SIZE];
-static FComplex in_b[RX_CHANNELS][3 * HALF_SAMPLE_BLOCK_SIZE];
+static float    rx_acc;                              /* NCO accumulator     */
+static FComplex in_a[SAMPLE_BLOCK_SIZE + RX_FILTER_SIZE];
+static FComplex in_b[3 * HALF_SAMPLE_BLOCK_SIZE];
 
 static FComplex rx_filter(FComplex *in)
 {
@@ -119,14 +111,13 @@ static inline FComplex agc(FComplex in)
     static double hold = 1.0;
 
     mag  = (in.real * in.real) + (in.imag * in.imag);
-    h    = (0.02 * mag) + (0.98 * hold);  /* LAMBDA = 0.02 */
+    h    = (0.02 * mag) + (0.98 * hold);
     hold = h;
     h    = 1.0 / sqrt(h);
     in.real = (float)(in.real * h);
     in.imag = (float)(in.imag * h);
     return in;
 }
-
 
 static float initial_doppler_correct(FComplex *in, float *delta_out)
 {
@@ -161,8 +152,8 @@ static float doppler_correct(FComplex *in, float *delta_out)
     error      = (float)(atan2(imag, real) * 0.008064516129);
     *delta_out -= error * 0.1f;
 
-    /* Clamp to +/- 200 Hz in rad/sample to prevent unbounded accumulation */
-#define SYNC_DELTA_MAX (float)(2 * PI * 200.0 / SAMPLE_RATE)
+    /* Clamp to +/- 200 Hz */
+#define SYNC_DELTA_MAX ((float)(2 * PI * 200.0 / SAMPLE_RATE))
     if      (*delta_out >  SYNC_DELTA_MAX) *delta_out =  SYNC_DELTA_MAX;
     else if (*delta_out < -SYNC_DELTA_MAX) *delta_out = -SYNC_DELTA_MAX;
 
@@ -176,13 +167,12 @@ static int train_and_equalize_on_preamble(FComplex *in)
 
     for (i = 0, count = 0; i < PREAMBLE_LENGTH; i++) {
         symbol = equalize_train(&in[i * 2], rx_preamble_lookup[i]);
-        if (symbol.real * rx_preamble_lookup[i].real > 0) count++;
+        if (symbol.real * rx_preamble_lookup[i].real > 0) count++;\
     }
     return count;
 }
 
-static void rx_downconvert(float *in, FComplex *outa, FComplex *outb,
-                           float *acc_val, float delta_val)
+static void rx_downconvert(float *in, FComplex *outa, FComplex *outb)
 {
     int i;
 
@@ -190,11 +180,11 @@ static void rx_downconvert(float *in, FComplex *outa, FComplex *outb,
         outa[i] = outa[i + SAMPLE_BLOCK_SIZE];
 
     for (i = 0; i < SAMPLE_BLOCK_SIZE; i++) {
-        outa[i + RX_FILTER_SIZE].real =  (float)cos(*acc_val) * in[i];
-        outa[i + RX_FILTER_SIZE].imag = -(float)sin(*acc_val) * in[i];
-        *acc_val += delta_val;
-        if      (*acc_val >= (float)(2 * PI)) *acc_val -= (float)(2 * PI);
-        else if (*acc_val <  0.0f)            *acc_val += (float)(2 * PI);
+        outa[i + RX_FILTER_SIZE].real =  (float)cos(rx_acc) * in[i];
+        outa[i + RX_FILTER_SIZE].imag = -(float)sin(rx_acc) * in[i];
+        rx_acc += CENTER_FREQ;
+        if      (rx_acc >= (float)(2 * PI)) rx_acc -= (float)(2 * PI);
+        else if (rx_acc <  0.0f)            rx_acc += (float)(2 * PI);
     }
 
     for (i = 0; i < SAMPLE_BLOCK_SIZE; i++)
@@ -222,10 +212,12 @@ static void rx_final_downconvert(FComplex *in, float delta_val)
     }
 }
 
+/* Implemented in main.c — dispatches based on g_framing */
+extern void output_data_framed(unsigned char *data, int length);
+
 void output_data(unsigned char *data, int length)
 {
-    fwrite(data, 1, length, stdout);
-    fflush(stdout);
+    output_data_framed(data, length);
 }
 
 void process_rx_block(unsigned short *in)
@@ -237,75 +229,62 @@ void process_rx_block(unsigned short *in)
     static int   bad_preamble_count;
     static int   preamble_start;
     static int   data_start;
-    static int   rx_chan;
     static float sync_delta;
 
     for (i = 0; i < SAMPLE_BLOCK_SIZE; i++)
         bb[i] = twos_to_float(in[i]);
 
     if (rx_state == RX_HUNTING) {
-        delta[LOW_RX_CHAN] = LO_FREQ;
-        delta[MID_RX_CHAN] = CENTER_FREQ;
-        delta[HIH_RX_CHAN] = HI_FREQ;
-        max_mag            = 0;
-
-        for (i = 0; i < RX_CHANNELS; i++) {
-            rx_downconvert(bb, in_a[i], in_b[i], &acc[i], delta[i]);
-            start = preamble_hunt(in_b[i], &mag);
-            if (mag > max_mag) {
-                preamble_start = start;
-                data_start     = preamble_start + (PREAMBLE_LENGTH * 2);
-                rx_chan        = i;
-                max_mag        = mag;
-            }
-        }
+        rx_downconvert(bb, in_a, in_b);
+        start = preamble_hunt(in_b, &max_mag);
+        preamble_start = start;
+        data_start     = preamble_start + (PREAMBLE_LENGTH * 2);
 
         kalman_reset_coffs();
         kalman_reset_ud();
-        preamble_matches = train_and_equalize_on_preamble(&in_b[rx_chan][preamble_start]);
+        preamble_matches = train_and_equalize_on_preamble(&in_b[preamble_start]);
 
         if ((preamble_matches >= (PREAMBLE_LENGTH - 25)) &&
-            (preamble_check(&in_b[rx_chan][preamble_start]) != 0)) {
-            sync_delta    = 0;
-            initial_doppler_correct(&in_b[rx_chan][preamble_start], &sync_delta);
-            sync_delta   *= 2.0f;
+            (preamble_check(&in_b[preamble_start]) != 0)) {
+            sync_delta = 0;
+            initial_doppler_correct(&in_b[preamble_start], &sync_delta);
+            sync_delta *= 2.0f;
 
-            rx_final_downconvert(&in_b[rx_chan][0],                    sync_delta);
-            rx_final_downconvert(&in_b[rx_chan][HALF_SAMPLE_BLOCK_SIZE], sync_delta);
-            rx_final_downconvert(&in_b[rx_chan][SAMPLE_BLOCK_SIZE],    sync_delta);
+            rx_final_downconvert(&in_b[0],                      sync_delta);
+            rx_final_downconvert(&in_b[HALF_SAMPLE_BLOCK_SIZE], sync_delta);
+            rx_final_downconvert(&in_b[SAMPLE_BLOCK_SIZE],      sync_delta);
 
             kalman_reset_coffs();
             kalman_reset_ud();
-            train_and_equalize_on_preamble(&in_b[rx_chan][preamble_start]);
+            train_and_equalize_on_preamble(&in_b[preamble_start]);
 
             bad_preamble_count = 0;
             rx_state           = RX_DATA;
             viterbi_decode_reset();
             deinterleaver_reset();
 
-            demodulate_and_equalize(&in_b[rx_chan][data_start]);
+            demodulate_and_equalize(&in_b[data_start]);
         }
     } else {
-        rx_downconvert(bb, in_a[rx_chan], in_b[rx_chan], &acc[rx_chan], delta[rx_chan]);
-        rx_final_downconvert(&in_b[rx_chan][SAMPLE_BLOCK_SIZE], sync_delta);
+        rx_downconvert(bb, in_a, in_b);
+        rx_final_downconvert(&in_b[SAMPLE_BLOCK_SIZE], sync_delta);
         kalman_reset_ud();
-        preamble_matches = train_and_equalize_on_preamble(&in_b[rx_chan][preamble_start]);
-        demodulate_and_equalize(&in_b[rx_chan][data_start]);
+        preamble_matches = train_and_equalize_on_preamble(&in_b[preamble_start]);
+        demodulate_and_equalize(&in_b[data_start]);
 
         if ((preamble_matches < PREAMBLE_LENGTH - 25) &&
-            (preamble_check(&in_b[rx_chan][preamble_start]) == 0)) {
+            (preamble_check(&in_b[preamble_start]) == 0)) {
             bad_preamble_count++;
-            if (bad_preamble_count >= con_bad_probe_threshold) {
+            if (bad_preamble_count >= con_bad_probe_threshold)
                 rx_state = RX_HUNTING;
-            }
-            start = preamble_hunt(in_b[rx_chan], &mag);
+            start = preamble_hunt(in_b, &mag);
             if (preamble_start != start) {
                 preamble_start = start;
                 data_start     = preamble_start + (PREAMBLE_LENGTH * 2);
                 kalman_reset_coffs();
             }
         } else {
-            doppler_correct(&in_b[rx_chan][preamble_start], &sync_delta);
+            doppler_correct(&in_b[preamble_start], &sync_delta);
             bad_preamble_count = 0;
         }
     }
