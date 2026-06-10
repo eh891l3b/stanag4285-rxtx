@@ -130,6 +130,4 @@ in your system's audio routing (PulseAudio/ALSA sink/source name, etc.).
 - The long interleavers (`l` suffix) require significantly more data to
   fill the interleaver buffer before the decoder can start producing
   output.  This is normal STANAG 4285 behaviour.
-- There is no 8N1 or any external serial framing — the modem's own
-  preamble and HDLC structure handle synchronisation. (set decoder software framing to "Synchronous")
 - Original modem code by C.H. Brain G4GUO (circa 2000).
